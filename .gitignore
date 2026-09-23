@@ -16,3 +16,4 @@ cloned-repository/
 .superpowers/
 build/
 dist/
+.DS_Store
