@@ -54,10 +54,12 @@
       outline-offset: 2px;
     }
 
+    /* A definite height, so the chart column can divide the leftover space between
+       its header, chart and export bar instead of guessing a chrome budget. */
     .app-shell {
       display: grid;
       grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
-      min-height: 100vh;
+      height: 100vh;
     }
 
     .control-rail {
@@ -218,10 +220,10 @@
     .chart-workspace {
       background: var(--ink);
       color: #eef4f1;
-      display: flex;
-      flex-direction: column;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
       min-width: 0;
-      padding: 24px 30px 28px;
+      padding: 16px 24px 14px;
     }
 
     .workspace-header {
@@ -230,8 +232,8 @@
       display: flex;
       gap: 20px;
       justify-content: space-between;
-      min-height: 54px;
-      padding-bottom: 13px;
+      min-height: 44px;
+      padding-bottom: 7px;
     }
 
     .workspace-header h2 {
@@ -239,6 +241,38 @@
       font-size: 22px;
       font-weight: 500;
       margin: 0;
+    }
+
+    .workspace-header-actions {
+      align-items: center;
+      display: flex;
+      gap: 12px;
+      margin-left: auto;
+    }
+
+    /* Offered only in the stacked layout. In the two-column desktop layout the chart
+       is height-bound, so collapsing the rail would not widen it by a single pixel —
+       showing a control that does nothing there would be misleading. */
+    .rail-toggle {
+      background: transparent;
+      border: 1px solid #385158;
+      border-radius: var(--radius);
+      color: #b8c9c5;
+      cursor: pointer;
+      display: none;
+      font: inherit;
+      padding: 6px 12px;
+      white-space: nowrap;
+    }
+
+    .rail-toggle:hover {
+      border-color: var(--brass);
+      color: #eef4f1;
+    }
+
+    .rail-toggle:focus-visible {
+      outline: 2px solid var(--brass);
+      outline-offset: 2px;
     }
 
     .status {
@@ -258,24 +292,29 @@
       color: #78d4c7;
     }
 
+    /* A size container so the frame can measure the space it actually has. Sizing
+       the frame off a hardcoded chrome budget broke as soon as the header grew a
+       line, so the square is fitted to the stage instead. */
     .chart-stage {
       align-items: center;
+      container-type: size;
       display: flex;
-      flex: 1;
       justify-content: center;
-      min-height: 420px;
-      padding: 22px 0;
+      min-height: 0;
+      padding: 6px 0;
     }
 
+    /* The render is square, and a circle in a square frame wastes nothing.
+       min(100%, 100cqh) is the largest square that fits the stage. */
     .chart-frame {
-      aspect-ratio: 4 / 3;
+      aspect-ratio: 1 / 1;
       background: #000000;
       border: 1px solid #31484e;
-      max-height: calc(100vh - 170px);
-      max-width: 1200px;
+      margin-inline: auto;
+      max-width: 1600px;
       overflow: hidden;
       position: relative;
-      width: 100%;
+      width: min(100%, 100cqh);
     }
 
     .chart-frame img {
@@ -306,7 +345,7 @@
       display: flex;
       gap: 10px;
       justify-content: flex-end;
-      padding-top: 13px;
+      padding-top: 7px;
     }
 
     .export-bar a {
@@ -338,13 +377,42 @@
         overflow: visible;
       }
 
+      /* Stacked layout scrolls as one page, so the shell stops dividing the
+         viewport height and the chart goes back to being width-driven. */
+      .app-shell {
+        height: auto;
+        min-height: 100vh;
+      }
+
+      /* The rail sits above the chart here, so it is the one layout where hiding
+         it actually moves the chart up into view. */
+      .rail-toggle {
+        display: inline-block;
+      }
+
+      .app-shell.rail-collapsed .control-rail {
+        display: none;
+      }
+
       .chart-workspace {
         min-height: 620px;
-        padding: 22px 18px;
+        padding: 16px 18px 14px;
+      }
+
+      /* Stacked layout scrolls, so the chart should be as wide as the column allows
+         rather than capped by the stage height. The rows must size to content for
+         that: with the 1fr row the square frame overflowed it and painted over the
+         header and export bar. */
+      .chart-workspace {
+        grid-template-rows: auto auto auto;
+      }
+
+      .chart-stage {
+        container-type: normal;
       }
 
       .chart-frame {
-        max-height: none;
+        width: 100%;
       }
     }
 
@@ -376,7 +444,7 @@
 </head>
 <body>
   <main class="app-shell">
-    <aside class="control-rail" aria-label="星图参数">
+    <aside class="control-rail" id="control-rail" aria-label="星图参数">
       <header class="brand">
         <p class="brand-kicker">Local observing desk</p>
         <h1>StarSkill<br>Sky Chart</h1>
@@ -465,7 +533,16 @@
     <section class="chart-workspace" aria-labelledby="chart-heading">
       <header class="workspace-header">
         <h2 id="chart-heading">Local sky / 本地星空</h2>
-        <p class="status" id="status" aria-live="polite">正在准备星图...</p>
+        <div class="workspace-header-actions">
+          <p class="status" id="status" aria-live="polite">正在准备星图...</p>
+          <button
+            id="rail-toggle"
+            class="rail-toggle"
+            type="button"
+            aria-controls="control-rail"
+            aria-expanded="true"
+          >收起参数</button>
+        </div>
       </header>
       <div class="chart-stage">
         <div class="chart-frame">
@@ -495,6 +572,8 @@
       const chartImage = document.getElementById("sky-chart-image");
       const pngExport = document.getElementById("export-png");
       const jsonExport = document.getElementById("export-json");
+      const shell = document.querySelector(".app-shell");
+      const railToggle = document.getElementById("rail-toggle");
       const nameFields = document.getElementById("name-target-fields");
       const coordinateFields = document.getElementById("coordinate-target-fields");
       const targetName = document.getElementById("target-name");
@@ -656,6 +735,12 @@
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         renderChart();
+      });
+
+      railToggle.addEventListener("click", () => {
+        const collapsed = shell.classList.toggle("rail-collapsed");
+        railToggle.setAttribute("aria-expanded", String(!collapsed));
+        railToggle.textContent = collapsed ? "展开参数" : "收起参数";
       });
 
       timestampInput.addEventListener("change", resetTimeWindow);

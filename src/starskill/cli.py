@@ -94,6 +94,22 @@ def load_json_object(path: Path) -> dict[str, object]:
     return payload
 
 
+def require_output_directory(path: Path, flag: str) -> None:
+    """Reject an output directory flag that an existing non-directory occupies.
+
+    Without this the first ``mkdir`` raises FileExistsError/NotADirectoryError and
+    escapes as a bare traceback, which is neither a documented exit code nor JSON.
+    """
+    if path.exists() and not path.is_dir():
+        raise InputValidationError(f"{flag} must name a directory, but {path} is a file")
+
+
+def require_output_file(path: Path, flag: str) -> None:
+    """Reject an output file flag that an existing directory occupies."""
+    if path.is_dir():
+        raise InputValidationError(f"{flag} must name a file, but {path} is a directory")
+
+
 def print_resolution_error(
     exc: TargetResolutionError,
 ) -> None:
@@ -140,7 +156,9 @@ def print_validation_error(exc: ValidationError) -> None:
     )
 
 
-def print_input_validation_error(exc: InputValidationError) -> None:
+def print_input_validation_error(
+    exc: InputValidationError, detail_type: str = "json_invalid"
+) -> None:
     print(
         json.dumps(
             {
@@ -150,7 +168,7 @@ def print_input_validation_error(exc: InputValidationError) -> None:
                     {
                         "location": [],
                         "message": str(exc),
-                        "type": "json_invalid",
+                        "type": detail_type,
                     }
                 ],
             },
@@ -316,6 +334,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "resolve":
         try:
+            if args.output:
+                require_output_file(args.output, "--output")
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
+            return 2
+        try:
             target = resolve_target(
                 args.target,
                 backend=SimbadBackend(),
@@ -354,6 +378,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_validation_error(exc)
             return 2
         try:
+            if args.output:
+                require_output_file(args.output, "--output")
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
+            return 2
+        try:
             target = resolve_target_ref(
                 reference,
                 backend=SimbadBackend() if reference.kind == "simbad" else None,
@@ -384,10 +414,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_sun_altitude_deg=args.max_sun_altitude_deg,
             )
         except InputValidationError as exc:
+            # Only a real JSON parse failure reaches here, so json_invalid is right.
             print_input_validation_error(exc)
             return 2
         except ValidationError as exc:
             print_validation_error(exc)
+            return 2
+        try:
+            require_output_file(args.output, "--output")
+            require_output_file(args.metadata, "--metadata")
+            require_output_file(args.figure, "--figure")
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
             return 2
         plan = plan_observation(ephemeris, criteria)
         write_visibility_csv(plan, args.output)
@@ -417,8 +455,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         try:
             relationship_task = RELATIONSHIP_TASK_ADAPTER.validate_python(payload)
+            require_output_file(args.output, "--output")
+            require_output_file(args.metadata, "--metadata")
         except ValidationError as exc:
             print_validation_error(exc)
+            return 2
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
             return 2
         if isinstance(relationship_task, SolarSystemRelationshipTask):
             result = calculate_solar_system_relationship(relationship_task)
@@ -465,8 +508,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         try:
             image_request = SDSSImageRequest.model_validate(payload)
+            require_output_directory(args.output_dir, "--output-dir")
         except ValidationError as exc:
             print_validation_error(exc)
+            return 2
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
             return 2
         try:
             result = fetch_sdss_image(
@@ -545,6 +592,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     if args.command == "ephemeris":
+        try:
+            require_output_file(args.output, "--output")
+            require_output_file(args.metadata, "--metadata")
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
+            return 2
         if args.target_file is not None:
             try:
                 target = ResolvedTarget.model_validate(
@@ -591,8 +644,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 min_target_altitude_deg=args.min_target_altitude_deg,
                 max_sun_altitude_deg=args.max_sun_altitude_deg,
             )
+            require_output_directory(args.output_dir, "--output-dir")
         except ValidationError as exc:
             print_validation_error(exc)
+            return 2
+        except InputValidationError as exc:
+            print_input_validation_error(exc, "value_error")
             return 2
         try:
             outcome = run_pipeline(
@@ -602,15 +659,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 backend=SimbadBackend(),
                 criteria=criteria,
             )
-        except InvalidTargetNameError as exc:
+        except TargetResolutionError as exc:
+            # Catch the base class: an unsupported solar-system body is neither a
+            # not-found nor a service failure, and catching only the three named
+            # subclasses let it escape as a bare traceback with exit 1.
             print_resolution_error(exc)
-            return 2
-        except TargetNotFoundError as exc:
-            print_resolution_error(exc)
-            return 3
-        except TargetServiceError as exc:
-            print_resolution_error(exc)
-            return 4
+            return resolution_error_exit_code(exc)
         print(
             json.dumps(
                 {

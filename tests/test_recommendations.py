@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from starskill.light_pollution import BLACK_MARBLE_PROVIDER
 from starskill.recommendations import HUMAN_REVIEW_ITEMS, recommend_tonight
@@ -177,6 +178,48 @@ def test_matching_weather_is_inclusive_and_static_radiance_never_upgrades_grade(
     assert recommendation.grade == "caution"
     assert "云量预报 60%" in recommendation.reasons
     assert "静态环境亮度指标：999 nW cm-2 sr-1" in recommendation.reasons
+
+
+FALL_BACK_ZONE = ZoneInfo("America/New_York")
+WINDOW_START_LOCAL = datetime(2026, 11, 1, 1, 30, tzinfo=FALL_BACK_ZONE)
+WINDOW_END_LOCAL = datetime(2026, 11, 1, 4, 0, tzinfo=FALL_BACK_ZONE)
+# The second pass of the repeated hour: 06:00Z, labelled 01:00-05:00.
+REPEATED_HOUR_SAMPLE = datetime(2026, 11, 1, 1, 0, fold=1, tzinfo=FALL_BACK_ZONE)
+
+
+def make_fall_back_plan() -> ObservationPlanResult:
+    return make_plan().model_copy(
+        update={
+            "windows": [
+                ObservationWindow(
+                    start_local=WINDOW_START_LOCAL,
+                    end_local=WINDOW_END_LOCAL,
+                    start_utc=WINDOW_START_LOCAL.astimezone(timezone.utc),
+                    end_utc=WINDOW_END_LOCAL.astimezone(timezone.utc),
+                    sample_count=3,
+                    peak_target_altitude_deg=40,
+                )
+            ]
+        }
+    )
+
+
+def test_repeated_hour_weather_matches_by_instant_not_wall_clock() -> None:
+    # The sample is in-window by instant but its wall-clock label reads earlier
+    # than the window start, so a label comparison would drop it and degrade the
+    # window to caution.
+    assert REPEATED_HOUR_SAMPLE.astimezone(timezone.utc) > WINDOW_START_LOCAL.astimezone(
+        timezone.utc
+    )
+    assert REPEATED_HOUR_SAMPLE.replace(tzinfo=None) < WINDOW_START_LOCAL.replace(tzinfo=None)
+
+    result = recommend_tonight(
+        make_fall_back_plan(),
+        make_weather(20, 0, timestamp=REPEATED_HOUR_SAMPLE),
+        make_light(),
+    )
+
+    assert "云量预报 20%" in result.recommendations[0].reasons
 
 
 def test_missing_window_weather_is_caution_even_when_forecast_is_available() -> None:

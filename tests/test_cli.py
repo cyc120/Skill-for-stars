@@ -447,6 +447,104 @@ def test_ephemeris_command_writes_csv_and_json(tmp_path, capsys) -> None:
     assert len(metadata["samples"]) == 49
 
 
+def test_run_reports_an_unsupported_solar_system_body_as_validation_error(
+    tmp_path: Path, capsys
+) -> None:
+    task_path = write_json(
+        tmp_path / "task.json",
+        {
+            "task_type": "observation_plan",
+            "target": {"kind": "solar_system", "body": "pluto"},
+            "observer": {
+                "location_name": "Beijing",
+                "longitude": 116.4074,
+                "latitude": 39.9042,
+                "timezone": "Asia/Shanghai",
+            },
+            "time_range": {
+                "start": "2026-01-10 18:00:00",
+                "end": "2026-01-11 02:00:00",
+            },
+        },
+    )
+    output_dir = tmp_path / "out"
+
+    exit_code = main(["run", str(task_path), "--output-dir", str(output_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "unsupported_solar_system_body"
+    # The failed run still records its own structured evidence.
+    manifest = json.loads((output_dir / "run.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["issues"][0]["code"] == "unsupported_solar_system_body"
+
+
+def test_output_flags_reject_a_path_an_existing_entry_occupies(
+    tmp_path: Path, capsys
+) -> None:
+    occupied_file = tmp_path / "occupied"
+    occupied_file.write_text("not a directory", encoding="utf-8")
+    occupied_dir = tmp_path / "occupied-dir"
+    occupied_dir.mkdir()
+    free = tmp_path / "free"
+    task = str(PROJECT_ROOT / "examples/observation_m42_beijing.json")
+    ephemeris_path = tmp_path / "ephemeris.json"
+    write_m42_ephemeris(ephemeris_path)
+
+    cases = [
+        (["run", task, "--output-dir", str(occupied_file)], "--output-dir"),
+        (
+            [
+                "fetch-image",
+                str(PROJECT_ROOT / "examples/m51_sdss_image.json"),
+                "--output-dir",
+                str(occupied_file),
+            ],
+            "--output-dir",
+        ),
+        (
+            [
+                "relationship",
+                str(PROJECT_ROOT / "examples/relationships/mars_m31.json"),
+                "--output",
+                str(occupied_dir),
+                "--metadata",
+                str(free / "relationship.json"),
+            ],
+            "--output",
+        ),
+        (
+            ["ephemeris", task, "--output", str(occupied_dir), "--metadata", str(free / "e.json")],
+            "--output",
+        ),
+        (
+            [
+                "plan",
+                str(ephemeris_path),
+                "--output",
+                str(free / "visibility.csv"),
+                "--metadata",
+                str(free / "result.json"),
+                "--figure",
+                str(occupied_dir),
+            ],
+            "--figure",
+        ),
+        (["resolve", "M42", "--output", str(occupied_dir)], "--output"),
+    ]
+
+    for argv, flag in cases:
+        assert main(argv) == 2, argv
+        captured = capsys.readouterr()
+        payload = json.loads(captured.err)
+        assert payload["error"] == "validation_error"
+        assert flag in payload["details"][0]["message"]
+        assert captured.out == ""
+    assert not free.exists()
+
+
 def test_resolve_target_and_ephemeris_accept_typed_references(
     tmp_path: Path, capsys
 ) -> None:

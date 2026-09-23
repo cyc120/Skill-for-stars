@@ -13,8 +13,8 @@ from astropy import units as u
 from astropy.config.paths import set_temp_cache
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_body, get_sun
 from astropy.time import Time
-from astropy.utils import iers
 
+from starskill.astropy_offline import offline_iers
 from starskill.schemas import (
     AstronomicalTargetSource,
     EphemerisResult,
@@ -54,7 +54,15 @@ def build_time_grid(
     timezone_name: str,
     interval_minutes: int,
 ) -> list[TimePoint]:
-    """Build an inclusive local-time grid and its UTC equivalents."""
+    """Build an inclusive grid of uniformly spaced UTC instants with local labels.
+
+    The cadence is held in UTC rather than local wall-clock time. Across a DST
+    transition the local clock skips or repeats an hour, so advancing a local
+    datetime by a fixed step emits nonexistent local times that resolve to the
+    same instant as a real one: rows duplicated, UTC no longer monotonic, and
+    the run still reports success. Uniform real time is what the AltAz samples
+    need; the local label is derived from each instant for display only.
+    """
     if interval_minutes <= 0:
         raise ValueError("interval_minutes must be greater than zero")
 
@@ -69,15 +77,24 @@ def build_time_grid(
         if end.tzinfo is None
         else end.astimezone(local_zone)
     )
-    if local_end < local_start:
-        raise ValueError("end must be later than or equal to start")
-
     step = timedelta(minutes=interval_minutes)
 
+    start_utc = local_start.astimezone(timezone.utc)
+    end_utc = local_end.astimezone(timezone.utc)
+    # Compare the instants, not the wall-clock fields: two aware datetimes sharing
+    # one tzinfo object compare by their local fields, which is the order a DST gap
+    # can invert. A wall-clock guard over a UTC loop would accept a range and then
+    # return an empty grid for it.
+    # Strictly later, because a gap can also collapse a window to a single instant:
+    # local 02:30-03:30 on a spring-forward night is zero minutes of real time, and
+    # a one-sample "window" would misrepresent it. The task schema agrees.
+    if end_utc <= start_utc:
+        raise ValueError("end must be later than start")
+
     points: list[TimePoint] = []
-    current = local_start
-    while current <= local_end:
-        points.append(TimePoint(local=current, utc=current.astimezone(timezone.utc)))
+    current = start_utc
+    while current <= end_utc:
+        points.append(TimePoint(local=current.astimezone(local_zone), utc=current))
         current += step
     return points
 
@@ -98,7 +115,7 @@ def calculate_ephemeris(
         interval_minutes=task.interval_minutes,
     )
     with TemporaryDirectory(prefix="starskill-astropy-") as cache_dir:
-        with set_temp_cache(cache_dir), iers.conf.set_temp("auto_download", False):
+        with set_temp_cache(cache_dir), offline_iers():
             times = Time([point.utc for point in points], scale="utc")
             location = EarthLocation(
                 lon=task.observer.longitude * u.deg,

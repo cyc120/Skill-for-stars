@@ -6,10 +6,15 @@ from io import BytesIO
 import json
 from pathlib import Path
 import re
+import warnings
 
+import numpy as np
 from PIL import Image, ImageChops
+import matplotlib
+from matplotlib import font_manager
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.ft2font import FT2Font
 from matplotlib.patches import Circle, Wedge
 import pytest
 
@@ -136,16 +141,137 @@ def test_render_has_expected_layer_order_and_linked_png_digest(fixed_chart) -> N
 
 def test_png_is_exact_rgb_canvas_and_nonblank(fixed_chart) -> None:
     image = Image.open(BytesIO(fixed_chart.png_bytes))
-    assert image.size == (1200, 900)
+    assert image.size == (2400, 2400)
     assert image.mode == "RGB"
     assert image.getpixel((0, 0)) == (0, 0, 0)
     assert ImageChops.difference(image, Image.new("RGB", image.size)).getbbox()
+
+
+def test_sky_disk_fills_the_canvas(fixed_chart) -> None:
+    # A circle in a 4:3 canvas wastes a quarter of its width, so this guards the
+    # shape of the layout rather than the pixel count. Masking the exact background
+    # fill excludes the cardinal labels, constellation lines and stars near the rim.
+    image = Image.open(BytesIO(fixed_chart.png_bytes)).convert("RGB")
+    pixels = np.asarray(image)
+    disk = np.all(pixels == (5, 7, 12), axis=2)
+    rows = np.flatnonzero(disk.any(axis=1))
+    cols = np.flatnonzero(disk.any(axis=0))
+    diameter = max(cols[-1] - cols[0] + 1, rows[-1] - rows[0] + 1)
+
+    assert diameter >= 0.86 * image.width
+    assert diameter >= 0.86 * image.height
+    # Centred horizontally; the vertical centre sits higher to leave the footer band.
+    assert abs((cols[0] + cols[-1]) / 2 - image.width / 2) <= 4
+    assert pixels[0, 0].tolist() == [0, 0, 0]
+    assert pixels[-1, -1].tolist() == [0, 0, 0]
+
+
+def test_label_scale_matches_the_live_axes_transform() -> None:
+    # The label collision model converts points to data units through this scale.
+    # Deriving it from the requested box rather than the aspect-adjusted one made it
+    # 17% too small once before, which let overlapping labels go undetected.
+    figure = Figure(
+        figsize=(
+            sky_chart_module.CANVAS_WIDTH_PX / sky_chart_module.CANVAS_DPI,
+            sky_chart_module.CANVAS_HEIGHT_PX / sky_chart_module.CANVAS_DPI,
+        ),
+        dpi=sky_chart_module.CANVAS_DPI,
+    )
+    FigureCanvasAgg(figure)
+    axes = figure.add_axes(sky_chart_module.PLOT_BOX)
+    axes.set_xlim(-sky_chart_module.AXIS_LIMIT, sky_chart_module.AXIS_LIMIT)
+    axes.set_ylim(-sky_chart_module.AXIS_LIMIT, sky_chart_module.AXIS_LIMIT)
+    axes.set_aspect("equal")
+    try:
+        figure.canvas.draw()
+        inverse = axes.transData.inverted()
+        (_, y0), (_, y1) = inverse.transform((0, 0)), inverse.transform((0, 1))
+        measured = abs(y1 - y0)
+
+        assert measured == pytest.approx(
+            sky_chart_module._DATA_UNITS_PER_PIXEL, rel=0.01
+        )
+    finally:
+        figure.clear()
+
+
+def test_text_sizes_clear_the_screen_legibility_floor() -> None:
+    # A glyph is worth ``pt * (DPI/72) * (display_side / CANVAS_WIDTH_PX)`` CSS
+    # pixels; DPI and pixel count cancel, so only the canvas-pixel size matters.
+    display_side = 770.0  # fit-mode chart side on a 1440x900 viewport
+    scale = display_side / sky_chart_module.CANVAS_WIDTH_PX
+    for canvas_px, floor_css_px in (
+        (sky_chart_module._FOOTER_FONT_PX, 12.0),
+        (sky_chart_module._OBJECT_LABEL_FONT_PX, 11.0),
+        (sky_chart_module._TARGET_LABEL_FONT_PX, 11.0),
+        (sky_chart_module._CARDINAL_FONT_PX, 12.0),
+    ):
+        assert canvas_px * scale >= floor_css_px
 
 
 def test_fixed_render_png_bytes_are_deterministic(service, fixed_chart) -> None:
     repeated = service.render(FIXED_REQUEST)
     assert repeated.png_bytes == fixed_chart.png_bytes
     assert repeated.metadata.render.png_sha256 == fixed_chart.metadata.render.png_sha256
+
+
+CJK_LABEL_SAMPLE = "木星 天王星 北京"
+
+
+def render_label(families: list[str]) -> bytes:
+    with sky_chart_module.deterministic_astropy_matplotlib():
+        matplotlib.rcParams["font.family"] = families
+        figure = Figure(figsize=(3, 0.6), facecolor="#000000")
+        FigureCanvasAgg(figure)
+        figure.text(
+            0.5, 0.5, CJK_LABEL_SAMPLE, color="#ffffff", fontsize=12, ha="center", va="center"
+        )
+        buffer = BytesIO()
+        with warnings.catch_warnings():
+            # The DejaVu-only control is expected to miss these glyphs.
+            warnings.simplefilter("ignore", UserWarning)
+            figure.savefig(buffer, format="png", facecolor="#000000")
+        return buffer.getvalue()
+
+
+def test_font_family_keeps_dejavu_first_and_appends_cjk_fallbacks() -> None:
+    with sky_chart_module.deterministic_astropy_matplotlib():
+        families = list(matplotlib.rcParams["font.family"])
+    assert families[0] == "DejaVu Sans"
+    assert families[1:] == list(sky_chart_module.cjk_font_fallbacks())
+
+
+def test_resolved_cjk_fallbacks_cover_the_glyphs_the_chart_draws() -> None:
+    fallbacks = sky_chart_module.cjk_font_fallbacks()
+    if not fallbacks:
+        pytest.skip("host has no CJK-capable font installed")
+    for character in CJK_LABEL_SAMPLE.replace(" ", ""):
+        assert any(
+            FT2Font(
+                font_manager.findfont(
+                    font_manager.FontProperties(family=name), fallback_to_default=False
+                )
+            ).get_char_index(ord(character))
+            for name in fallbacks
+        ), character
+
+
+def test_cjk_labels_render_differently_from_dejavu_only() -> None:
+    fallbacks = sky_chart_module.cjk_font_fallbacks()
+    if not fallbacks:
+        pytest.skip("host has no CJK-capable font installed")
+    assert render_label(["DejaVu Sans", *fallbacks]) != render_label(["DejaVu Sans"])
+
+
+def test_host_without_cjk_fonts_keeps_the_dejavu_only_family(monkeypatch) -> None:
+    monkeypatch.setattr(sky_chart_module.font_manager.fontManager, "ttflist", [])
+    sky_chart_module.cjk_font_fallbacks.cache_clear()
+    try:
+        assert sky_chart_module.cjk_font_fallbacks() == ()
+        with sky_chart_module.deterministic_astropy_matplotlib():
+            assert list(matplotlib.rcParams["font.family"]) == ["DejaVu Sans"]
+    finally:
+        sky_chart_module.cjk_font_fallbacks.cache_clear()
 
 
 def test_invisible_object_is_recorded_but_not_drawn(fixed_chart) -> None:
@@ -188,8 +314,10 @@ def test_moon_patch_coverage_tracks_illumination_and_stays_below_horizon_hidden(
             "illumination_fraction": 0.25,
         }
     )
+    labels = sky_chart_module._LabelPlacer(axes)
     try:
-        SkyChartRenderer._draw_moon(axes, visible_moon)
+        SkyChartRenderer._draw_moon(axes, visible_moon, labels)
+        labels.draw()
         assert [type(patch) for patch in axes.patches] == [Circle, Wedge, Circle]
         illuminated = axes.patches[1]
         assert isinstance(illuminated, Wedge)
@@ -205,9 +333,50 @@ def test_moon_patch_coverage_tracks_illumination_and_stays_below_horizon_hidden(
                 "illumination_fraction": 0.75,
             }
         )
-        SkyChartRenderer._draw_moon(axes, hidden_moon)
+        SkyChartRenderer._draw_moon(axes, hidden_moon, labels)
+        labels.draw()
         assert len(axes.patches) == 3
         assert len(axes.texts) == 1
+    finally:
+        figure.clear()
+
+
+def label_box(text) -> tuple[float, float, float, float]:
+    width, height = sky_chart_module._label_extent(text.get_text(), text.get_fontsize())
+    x, y = text.get_position()
+    return (x, y, x + width, y + height)
+
+
+def test_nearby_labels_are_offset_so_they_do_not_overprint() -> None:
+    figure = Figure()
+    FigureCanvasAgg(figure)
+    axes = figure.add_subplot()
+    labels = sky_chart_module._LabelPlacer(axes)
+    try:
+        labels.add(0.0, 0.0, "Jupiter / 木星", color="#fff", fontsize=6.5, zorder=5)
+        labels.add(0.01, 0.01, "Neptune / 海王星", color="#fff", fontsize=6.5, zorder=5)
+        labels.add(0.02, -0.01, "Saturn / 土星", color="#fff", fontsize=6.5, zorder=5)
+        labels.draw()
+
+        boxes = [label_box(text) for text in axes.texts]
+        for index, box in enumerate(boxes):
+            for other in boxes[index + 1 :]:
+                assert not sky_chart_module._boxes_overlap(box, other)
+    finally:
+        figure.clear()
+
+
+def test_a_lone_label_keeps_the_default_offset() -> None:
+    figure = Figure()
+    FigureCanvasAgg(figure)
+    axes = figure.add_subplot()
+    labels = sky_chart_module._LabelPlacer(axes)
+    try:
+        labels.add(0.0, 0.0, "M42", color="#fff", fontsize=8, zorder=6)
+        labels.add(0.8, 0.8, "Jupiter / 木星", color="#fff", fontsize=6.5, zorder=5)
+        labels.draw()
+
+        assert axes.texts[1].get_position() == pytest.approx((0.825, 0.825))
     finally:
         figure.clear()
 
@@ -519,7 +688,7 @@ def test_render_store_rejects_png_metadata_digest_mismatch(fixed_chart) -> None:
 def test_render_store_rejects_matching_digest_non_png_bytes(fixed_chart) -> None:
     invalid_png = chart_with_png_bytes(fixed_chart, b"not a png")
 
-    with pytest.raises(ValueError, match="valid 1200x900 RGB PNG"):
+    with pytest.raises(ValueError, match="valid 2400x2400 RGB PNG"):
         RenderStore().put(invalid_png)
 
 

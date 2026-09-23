@@ -1,5 +1,7 @@
 """Deterministic tonight recommendations from geometry and external evidence."""
 
+from datetime import timezone
+
 from starskill.schemas import (
     LightPollutionResult,
     ObservationPlanResult,
@@ -29,6 +31,8 @@ def recommend_tonight(
         _recommend_window(
             window.start_local,
             window.end_local,
+            window.start_utc,
+            window.end_utc,
             weather.samples,
             weather,
             light_pollution,
@@ -48,11 +52,20 @@ def recommend_tonight(
 def _recommend_window(
     start,
     end,
+    start_utc,
+    end_utc,
     samples: list[WeatherSample],
     weather: WeatherForecast,
     light_pollution: LightPollutionResult,
 ) -> RecommendationWindow:
-    matching = [sample for sample in samples if start <= sample.timestamp_local <= end]
+    # Match on instants, not wall-clock labels. Across a fall-back the local clock
+    # repeats an hour, so an in-window sample's label can read earlier than the
+    # window start; comparing labels would drop it. The labels stay on the result.
+    matching = [
+        sample
+        for sample in samples
+        if start_utc <= sample.timestamp_local.astimezone(timezone.utc) <= end_utc
+    ]
     reasons: list[str]
     if (
         weather.source.availability == "unavailable"

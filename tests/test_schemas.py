@@ -5,10 +5,12 @@ import pytest
 from pydantic import ValidationError
 
 from starskill.schemas import (
+    AstronomicalRelationshipTask,
     AstronomyImageSearchRequest,
     ObservingConditionsRequest,
     ObservationTask,
     SimbadTargetRef,
+    SolarSystemRelationshipTask,
     TonightRecommendationRequest,
 )
 
@@ -39,6 +41,66 @@ def test_valid_observation_task_uses_documented_defaults(valid_payload: dict) ->
     assert task.time_range.start == datetime(2026, 1, 10, 18, 0)
     assert task.output.language == "zh-CN"
     assert task.output.formats == ["json", "csv", "png", "md"]
+
+
+def dst_emptied_payload(valid_payload: dict) -> dict:
+    """A wall-clock-ordered window whose local hour a spring-forward skips."""
+    payload = deepcopy(valid_payload)
+    payload["observer"]["timezone"] = "America/New_York"
+    payload["time_range"] = {
+        "start": "2023-03-12 02:30:00",
+        "end": "2023-03-12 03:00:00",
+    }
+    return payload
+
+
+def test_observation_task_rejects_a_window_a_dst_gap_empties(valid_payload: dict) -> None:
+    with pytest.raises(ValidationError, match="non-empty interval in real time"):
+        ObservationTask.model_validate(dst_emptied_payload(valid_payload))
+
+
+def test_observation_task_accepts_a_window_that_spans_a_dst_gap(valid_payload: dict) -> None:
+    payload = deepcopy(valid_payload)
+    payload["observer"]["timezone"] = "America/New_York"
+    payload["time_range"] = {
+        "start": "2023-03-12 00:00:00",
+        "end": "2023-03-12 05:00:00",
+    }
+
+    task = ObservationTask.model_validate(payload)
+
+    assert task.time_range.end > task.time_range.start
+
+
+def test_relationship_tasks_reject_a_window_a_dst_gap_empties(valid_payload: dict) -> None:
+    observer = dst_emptied_payload(valid_payload)["observer"]
+    time_range = dst_emptied_payload(valid_payload)["time_range"]
+
+    relationship_payloads = [
+        (
+            AstronomicalRelationshipTask,
+            {
+                "task_type": "astronomical_relationship",
+                "primary": {"kind": "solar_system", "body": "mars"},
+                "secondary": {"kind": "simbad", "name": "M31"},
+                "observer": observer,
+                "time_range": time_range,
+            },
+        ),
+        (
+            SolarSystemRelationshipTask,
+            {
+                "task_type": "solar_system_relationship",
+                "targets": ["moon", "jupiter"],
+                "observer": observer,
+                "time_range": time_range,
+            },
+        ),
+    ]
+
+    for model, payload in relationship_payloads:
+        with pytest.raises(ValidationError, match="non-empty interval in real time"):
+            model.model_validate(payload)
 
 
 @pytest.mark.parametrize(

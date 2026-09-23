@@ -55,6 +55,36 @@ class TimeRange(InputModel):
         return self
 
 
+def require_non_empty_utc_range(time_range: TimeRange, observer: Observer) -> None:
+    """Reject a local window that is empty once resolved to real instants.
+
+    ``TimeRange.end_must_follow_start`` compares the wall-clock fields, which is
+    not the order the sampler uses. On a spring-forward night a local window such
+    as 02:30-03:00 names an hour that never happens and runs backwards in UTC, so
+    the sample grid would come out empty and every downstream command would fail
+    with an unhelpful error. Resolving both ends through the observer's zone and
+    comparing the instants catches that here, where it is still input validation.
+    """
+    zone = ZoneInfo(observer.timezone)
+    start = (
+        time_range.start
+        if time_range.start.tzinfo is not None
+        else time_range.start.replace(tzinfo=zone)
+    )
+    end = (
+        time_range.end
+        if time_range.end.tzinfo is not None
+        else time_range.end.replace(tzinfo=zone)
+    )
+    if end.astimezone(timezone.utc) <= start.astimezone(timezone.utc):
+        raise ValueError(
+            "time_range must span a non-empty interval in real time: "
+            f"{time_range.start.isoformat()} to {time_range.end.isoformat()} is empty "
+            f"or runs backwards in {observer.timezone}; a daylight-saving transition "
+            "may skip the requested local hour"
+        )
+
+
 class OutputOptions(InputModel):
     language: str = "zh-CN"
     level: str = "classroom"
@@ -71,6 +101,7 @@ class ObservationTask(InputModel):
 
     @model_validator(mode="after")
     def normalize_legacy_target(self) -> "ObservationTask":
+        require_non_empty_utc_range(self.time_range, self.observer)
         if isinstance(self.target, str):
             name = self.target.strip()
             if not name:
@@ -215,6 +246,7 @@ class SolarSystemRelationshipTask(InputModel):
 
     @model_validator(mode="after")
     def require_moon_and_jupiter(self) -> "SolarSystemRelationshipTask":
+        require_non_empty_utc_range(self.time_range, self.observer)
         if self.targets != ["moon", "jupiter"]:
             raise ValueError("targets must be exactly ['moon', 'jupiter']")
         return self
@@ -476,6 +508,11 @@ class AstronomicalRelationshipTask(InputModel):
     observer: Observer
     time_range: TimeRange
     interval_minutes: int = Field(default=20, ge=1, le=120)
+
+    @model_validator(mode="after")
+    def require_non_empty_time_range(self) -> "AstronomicalRelationshipTask":
+        require_non_empty_utc_range(self.time_range, self.observer)
+        return self
 
 
 class AstronomicalTargetSource(InputModel):
@@ -849,8 +886,8 @@ class SkyChartExportRequest(InputModel):
 
 class SkyChartRenderMetadata(InputModel):
     projection: Literal["azimuthal_equidistant_zenith"]
-    width_px: Literal[1200]
-    height_px: Literal[900]
+    width_px: Literal[2400]
+    height_px: Literal[2400]
     layer_order: list[
         Literal[
             "background",

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from hashlib import sha256
 from importlib import metadata as importlib_metadata
 import math
@@ -28,15 +29,18 @@ from astropy.coordinates import (
     solar_system_ephemeris,
 )
 from astropy.time import Time
-from astropy.utils import iers
 import astropy
 import matplotlib
+from matplotlib import font_manager
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.ft2font import FT2Font
 from matplotlib.patches import Circle, Wedge
+from matplotlib.textpath import TextPath
 import numpy as np
 
 import starskill.target_resolver as target_resolver_module
+from starskill.astropy_offline import offline_iers
 from starskill.schemas import (
     SkyChartAltAzCoordinates,
     SkyChartCalculationMetadata,
@@ -72,9 +76,84 @@ from starskill.target_resolver import (
 )
 
 
-CANVAS_WIDTH_PX = 1200
-CANVAS_HEIGHT_PX = 900
-CANVAS_DPI = 100
+# The sky chart is a circle, so the canvas is square: a 4:3 canvas wasted a quarter
+# of its width once ``set_aspect("equal")`` squared the axes box. The raster is
+# always exactly CANVAS_*_PX pixels because the figure is built as
+# ``figsize=(W/DPI, H/DPI), dpi=DPI``; DPI only sets how many pixels a point is
+# worth (``px = pt * DPI / 72``). Raise both together to scale, not DPI alone.
+CANVAS_WIDTH_PX = 2400
+CANVAS_HEIGHT_PX = 2400
+CANVAS_DPI = 200
+# Axes box in figure fractions, and the data half-range it is drawn over. The box is
+# already square, so ``set_aspect("equal")`` never has to shrink it and the disk is
+# limited only by the box side. Bottom inset leaves a band for the two-line footer.
+PLOT_BOX = (0.04, 0.062, 0.918, 0.918)
+AXIS_LIMIT = 1.05
+
+
+def pt_from_canvas_px(canvas_px: float) -> float:
+    """Convert a size in canvas pixels to points at CANVAS_DPI.
+
+    Sizes written in points silently change meaning whenever the canvas or the DPI
+    moves, because the raster is fixed at CANVAS_*_PX and DPI only sets how many
+    pixels a point is worth. Writing the drawing sizes in canvas pixels instead
+    keeps them stable across any future canvas change.
+    """
+    return canvas_px * 72.0 / CANVAS_DPI
+
+
+def marker_area(canvas_px: float) -> float:
+    """Scatter ``s`` (points squared) for a marker that wide in canvas pixels."""
+    return pt_from_canvas_px(canvas_px) ** 2
+
+
+def text_width_px(text: str, fontsize_pt: float) -> float:
+    """Width of ``text`` in canvas pixels using the chart's own fonts.
+
+    The footer carries the observer's free-text place name, which the schema allows
+    to run to 80 characters, so its width has to be measured rather than assumed.
+    """
+    if not text:
+        return 0.0
+    path = TextPath(
+        (0.0, 0.0),
+        text,
+        size=fontsize_pt,
+        prop=font_manager.FontProperties(family=matplotlib.rcParams["font.family"]),
+    )
+    return path.get_extents().width / 72.0 * CANVAS_DPI
+
+
+# Text sizes are chosen for on-screen legibility, not for the canvas: a glyph is
+# worth ``pt * (DPI/72) * (display_side / CANVAS_WIDTH_PX)`` CSS pixels, and at the
+# fit-mode display side of roughly 770 px that is about 0.29 CSS px per canvas px.
+# The footer therefore needs >= 37 canvas px to clear the ~12 CSS px floor — and it
+# only fits on one line up to about 10.5 pt, so it is drawn on two lines.
+_FOOTER_FONT_PX = 38.0
+# The observer supplies the place name and may use up to 80 characters, so the
+# footer shrinks to this floor and only then truncates.
+_FOOTER_MIN_FONT_PX = 24.0
+_FOOTER_MAX_WIDTH_RATIO = 0.96
+_OBJECT_LABEL_FONT_PX = 35.0
+_TARGET_LABEL_FONT_PX = 37.0
+_CARDINAL_FONT_PX = 40.0
+# Decorative sizes keep the original look, scaled by the canvas growth.
+_CONSTELLATION_LINE_PX = 2.9
+_HORIZON_LINE_PX = 4.3
+_HORIZON_INNER_LINE_PX = 2.5
+_SPOKE_LINE_PX = 1.8
+_ZENITH_DOT_PX = 6.2
+_MOON_OUTLINE_PX = 2.9
+_PLANET_MARKER_PX = 24.0
+_PLANET_EDGE_PX = 1.4
+_TARGET_RING_PX = 46.0
+_TARGET_CROSS_PX = 26.0
+_TARGET_RING_LINE_PX = 3.9
+_TARGET_CROSS_LINE_PX = 4.6
+# Star markers: linear width, brightest first, floored so the faintest stay visible.
+_STAR_BRIGHT_PX = 20.7
+_STAR_FLOOR_PX = 6.2
+_STAR_MAGNITUDE_FALLOFF_PX = 3.0
 LAYER_ORDER = [
     "background",
     "horizon_grid",
@@ -136,17 +215,255 @@ def sort_stars_dim_to_bright(stars: Sequence[CatalogStar]) -> tuple[CatalogStar,
     return tuple(sorted(stars, key=lambda star: (-star.magnitude, star.star_id)))
 
 
+# PLOT_BOX is square, so this is its side; taking the min keeps it correct even if a
+# future box is not square and ``set_aspect("equal")`` shrinks one direction.
+_PLOT_SIDE_PX = min(PLOT_BOX[2] * CANVAS_WIDTH_PX, PLOT_BOX[3] * CANVAS_HEIGHT_PX)
+_DATA_UNITS_PER_PIXEL = 2 * AXIS_LIMIT / _PLOT_SIDE_PX
+# Candidate anchor offsets, tried in order until a label clears the placed ones.
+_LABEL_OFFSETS = (
+    (0.025, 0.025),
+    (0.025, 0.075),
+    (0.025, -0.045),
+    (0.025, 0.125),
+    (0.025, -0.095),
+    (0.025, 0.175),
+    (0.085, 0.025),
+    (-0.085, 0.025),
+)
+_LABEL_PADDING = 0.006
+
+
+def _label_extent(label: str, fontsize: float) -> tuple[float, float]:
+    """A label's width and height in data units.
+
+    The width is measured from the real font, not estimated per character: an
+    em-per-character guess ran up to 43% narrow for wide Latin glyphs, which let the
+    placer accept positions that then overprinted. The height stays the em size,
+    which is conservative because glyph ink rarely reaches it.
+    """
+    height_px = fontsize / 72.0 * CANVAS_DPI
+    return (
+        text_width_px(label, fontsize) * _DATA_UNITS_PER_PIXEL,
+        height_px * _DATA_UNITS_PER_PIXEL,
+    )
+
+
+def truncate_to_width(text: str, fontsize_pt: float, max_width_px: float) -> str:
+    """Shorten ``text`` with an ellipsis until it fits ``max_width_px``."""
+    if text_width_px(text, fontsize_pt) <= max_width_px:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if text_width_px(text[:middle] + "…", fontsize_pt) <= max_width_px:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + "…"
+
+
+def fit_footer_lines(
+    lines: Sequence[str], fontsize_px: float
+) -> tuple[tuple[str, ...], float]:
+    """Shrink, then truncate, so every footer line fits across the canvas.
+
+    Returns the lines and the canvas-pixel font size to draw them at. Scaling the
+    whole block together keeps the lines visually consistent.
+    """
+    max_width = CANVAS_WIDTH_PX * _FOOTER_MAX_WIDTH_RATIO
+    widest = max(text_width_px(line, pt_from_canvas_px(fontsize_px)) for line in lines)
+    if widest > max_width:
+        fontsize_px = max(
+            _FOOTER_MIN_FONT_PX, fontsize_px * max_width / widest
+        )
+    fontsize_pt = pt_from_canvas_px(fontsize_px)
+    return (
+        tuple(truncate_to_width(line, fontsize_pt, max_width) for line in lines),
+        fontsize_px,
+    )
+
+
+def _boxes_overlap(
+    first: tuple[float, float, float, float], second: tuple[float, float, float, float]
+) -> bool:
+    left, bottom, right, top = first
+    other_left, other_bottom, other_right, other_top = second
+    return not (
+        right + _LABEL_PADDING <= other_left
+        or left >= other_right + _LABEL_PADDING
+        or top + _LABEL_PADDING <= other_bottom
+        or bottom >= other_top + _LABEL_PADDING
+    )
+
+
+def _overlap_area(
+    first: tuple[float, float, float, float], second: tuple[float, float, float, float]
+) -> float:
+    """Overlap of two label boxes, counting the separation padding as overlap.
+
+    The padding is included so this ranks candidates on the same criterion
+    ``_boxes_overlap`` enforces; a purely geometric area would score a
+    padding-only near-miss as zero and tie with a genuinely clear candidate.
+    """
+    left = max(first[0], second[0] - _LABEL_PADDING)
+    bottom = max(first[1], second[1] - _LABEL_PADDING)
+    right = min(first[2], second[2] + _LABEL_PADDING)
+    top = min(first[3], second[3] + _LABEL_PADDING)
+    return max(0.0, right - left) * max(0.0, top - bottom)
+
+
+def canvas_data_bounds() -> tuple[float, float, float, float]:
+    """The whole canvas in data units: ``(x_min, y_min, x_max, y_max)``.
+
+    Labels are drawn with clipping off, so nothing stops one from being painted off
+    the raster. The placer needs these bounds to reject such candidates.
+    """
+    centre_x = PLOT_BOX[0] * CANVAS_WIDTH_PX + _PLOT_SIDE_PX / 2
+    centre_y = PLOT_BOX[1] * CANVAS_HEIGHT_PX + _PLOT_SIDE_PX / 2
+    scale = _PLOT_SIDE_PX / (2 * AXIS_LIMIT)
+    return (
+        (0.0 - centre_x) / scale,
+        (0.0 - centre_y) / scale,
+        (CANVAS_WIDTH_PX - centre_x) / scale,
+        (CANVAS_HEIGHT_PX - centre_y) / scale,
+    )
+
+
+def _outside_area(box: tuple[float, float, float, float]) -> float:
+    x_min, y_min, x_max, y_max = canvas_data_bounds()
+    width = max(0.0, box[2] - box[0])
+    height = max(0.0, box[3] - box[1])
+    inside = max(0.0, min(box[2], x_max) - max(box[0], x_min)) * max(
+        0.0, min(box[3], y_max) - max(box[1], y_min)
+    )
+    return width * height - inside
+
+
+class _LabelPlacer:
+    """Collect sky-chart labels, then draw them so nearby ones do not overprint.
+
+    The moon, the planets and the target all label themselves at a fixed offset,
+    which collides whenever two of them sit close on the sky. Anchors are chosen
+    from a fixed ladder in registration order, so the result stays deterministic.
+    """
+
+    def __init__(self, axes) -> None:
+        self._axes = axes
+        self._pending: list[tuple[float, float, str, str, float, float]] = []
+        self._placed: list[tuple[float, float, float, float]] = []
+
+    def add(
+        self, x: float, y: float, label: str, *, color: str, fontsize: float, zorder: float
+    ) -> None:
+        self._pending.append((x, y, label, color, fontsize, zorder))
+
+    def _choose_offset(
+        self, x: float, y: float, width: float, height: float
+    ) -> tuple[float, float]:
+        """Pick the candidate that stays on the canvas and clears the placed boxes.
+
+        Labels are not clipped by the axes, so a candidate that leaves the raster is
+        worse than one that merely crowds a neighbour: it silently loses glyphs.
+        Candidates are therefore ranked on (area off-canvas, area overlapping).
+        """
+        best: tuple[float, float] | None = None
+        best_cost: tuple[float, float] | None = None
+        for candidate in _LABEL_OFFSETS:
+            box = (
+                x + candidate[0],
+                y + candidate[1],
+                x + candidate[0] + width,
+                y + candidate[1] + height,
+            )
+            # Rank on the same padded test the renderer promises to satisfy, so a
+            # candidate the placer calls clear is one that really is clear.
+            crowded = [placed for placed in self._placed if _boxes_overlap(box, placed)]
+            outside = _outside_area(box)
+            if not crowded and outside == 0.0:
+                self._placed.append(box)
+                return candidate
+            cost = (outside, sum(_overlap_area(box, placed) for placed in crowded))
+            if best_cost is None or cost < best_cost:
+                best, best_cost = candidate, cost
+        assert best is not None
+        self._placed.append(
+            (x + best[0], y + best[1], x + best[0] + width, y + best[1] + height)
+        )
+        return best
+
+    def draw(self) -> None:
+        pending, self._pending = self._pending, []
+        for x, y, label, color, fontsize, zorder in pending:
+            width, height = _label_extent(label, fontsize)
+            dx, dy = self._choose_offset(x, y, width, height)
+            self._axes.text(
+                x + dx, y + dy, label, color=color, fontsize=fontsize, zorder=zorder
+            )
+
+
+# DejaVu Sans ships with matplotlib and stays the deterministic base font, but it
+# carries no CJK glyphs, so the bundled bilingual planet labels and any place name
+# the observer types would render as tofu boxes. matplotlib falls back glyph by
+# glyph only when ``font.family`` is a list of concrete family names, so append the
+# first installed CJK-capable families from this platform-ordered preference list.
+_CJK_FONT_CANDIDATES = (
+    "PingFang SC",  # macOS
+    "Hiragino Sans GB",
+    "Heiti TC",
+    "STHeiti",
+    "Songti SC",
+    "Arial Unicode MS",
+    "Microsoft YaHei",  # Windows
+    "SimHei",
+    "SimSun",
+    "Noto Sans CJK SC",  # Linux
+    "Noto Sans CJK JP",
+    "Source Han Sans SC",
+    "WenQuanYi Zen Hei",
+    "WenQuanYi Micro Hei",
+    "Droid Sans Fallback",
+)
+_CJK_FALLBACK_LIMIT = 3
+_CJK_PROBE_CHARACTER = "木"
+
+
+@lru_cache(maxsize=1)
+def cjk_font_fallbacks() -> tuple[str, ...]:
+    """Installed CJK-capable font families, in preference order.
+
+    Resolved once per process so repeated renders stay byte-for-byte identical.
+    A machine with no CJK font installed yields an empty tuple and keeps the
+    previous DejaVu-only behaviour instead of failing the render.
+    """
+    installed = {font.name for font in font_manager.fontManager.ttflist}
+    fallbacks: list[str] = []
+    for name in _CJK_FONT_CANDIDATES:
+        if name not in installed:
+            continue
+        try:
+            path = font_manager.findfont(
+                font_manager.FontProperties(family=name), fallback_to_default=False
+            )
+            covers_cjk = FT2Font(path).get_char_index(ord(_CJK_PROBE_CHARACTER)) != 0
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not covers_cjk:
+            continue
+        fallbacks.append(name)
+        if len(fallbacks) == _CJK_FALLBACK_LIMIT:
+            break
+    return tuple(fallbacks)
+
+
 @contextmanager
 def deterministic_astropy_matplotlib() -> Iterator[None]:
-    old_iers = iers.conf.auto_download
     old_rc = matplotlib.rcParams.copy()
     old_random_state = np.random.get_state()
-    iers.conf.auto_download = False
     matplotlib.rcParams.update(
         {
             "figure.dpi": CANVAS_DPI,
             "savefig.dpi": CANVAS_DPI,
-            "font.family": "DejaVu Sans",
+            "font.family": ["DejaVu Sans", *cjk_font_fallbacks()],
             "figure.facecolor": "#000000",
             "savefig.facecolor": "#000000",
             "savefig.transparent": False,
@@ -154,11 +471,13 @@ def deterministic_astropy_matplotlib() -> Iterator[None]:
     )
     np.random.seed(0)
     try:
-        with solar_system_ephemeris.set("builtin"):
+        with (
+            offline_iers(),
+            solar_system_ephemeris.set("builtin"),
+        ):
             yield
     finally:
         np.random.set_state(old_random_state)
-        iers.conf.auto_download = old_iers
         matplotlib.rcParams.update(old_rc)
 
 
@@ -281,9 +600,9 @@ class SkyChartRenderer:
             )
             try:
                 FigureCanvasAgg(figure)
-                axes = figure.add_axes((0.12, 0.11, 0.76, 0.84), facecolor="#000000")
-                axes.set_xlim(-1.05, 1.05)
-                axes.set_ylim(-1.05, 1.05)
+                axes = figure.add_axes(PLOT_BOX, facecolor="#000000")
+                axes.set_xlim(-AXIS_LIMIT, AXIS_LIMIT)
+                axes.set_ylim(-AXIS_LIMIT, AXIS_LIMIT)
                 axes.set_aspect("equal")
                 axes.axis("off")
 
@@ -293,9 +612,11 @@ class SkyChartRenderer:
                     axes, selection.constellation_segments, constellation_altaz
                 )
                 stars_drawn = self._draw_stars(axes, selection.catalog.stars, star_altaz)
-                self._draw_moon(axes, moon)
-                self._draw_planets(axes, planets, planet_records)
-                self._draw_target(axes, target)
+                labels = _LabelPlacer(axes)
+                self._draw_moon(axes, moon, labels)
+                self._draw_planets(axes, planets, planet_records, labels)
+                self._draw_target(axes, target, labels)
+                labels.draw()
                 self._draw_footer(figure, request, context, selection)
 
                 png_bytes = self._save_rgb_png(figure)
@@ -472,16 +793,35 @@ class SkyChartRenderer:
                     radius,
                     fill=False,
                     edgecolor="#33414d",
-                    linewidth=0.7 if altitude else 1.2,
+                    linewidth=pt_from_canvas_px(
+                        _HORIZON_INNER_LINE_PX if altitude else _HORIZON_LINE_PX
+                    ),
                     zorder=1,
                 )
             )
         for azimuth in (0, 90, 180, 270):
             x, y = project_altaz(0, azimuth)
-            axes.plot([0, x], [0, y], color="#202d36", linewidth=0.5, zorder=1)
-        axes.scatter([0], [0], s=3, c="#33414d", edgecolors="none", zorder=1)
+            axes.plot(
+                [0, x],
+                [0, y],
+                color="#202d36",
+                linewidth=pt_from_canvas_px(_SPOKE_LINE_PX),
+                zorder=1,
+            )
+        axes.scatter(
+            [0], [0], s=marker_area(_ZENITH_DOT_PX), c="#33414d", edgecolors="none", zorder=1
+        )
         for label, x, y in (("N", 0, 1.025), ("E", 1.025, 0), ("S", 0, -1.025), ("W", -1.025, 0)):
-            axes.text(x, y, label, color="#8ea0aa", fontsize=9, ha="center", va="center", zorder=1)
+            axes.text(
+                x,
+                y,
+                label,
+                color="#8ea0aa",
+                fontsize=pt_from_canvas_px(_CARDINAL_FONT_PX),
+                ha="center",
+                va="center",
+                zorder=1,
+            )
 
     @staticmethod
     def _draw_constellations(
@@ -501,7 +841,7 @@ class SkyChartRenderer:
                 [start_xy[0], end_xy[0]],
                 [start_xy[1], end_xy[1]],
                 color="#40576d",
-                linewidth=0.8,
+                linewidth=pt_from_canvas_px(_CONSTELLATION_LINE_PX),
                 alpha=0.8,
                 zorder=2,
             )
@@ -524,7 +864,14 @@ class SkyChartRenderer:
             x, y = project_altaz(altitude, azimuth)
             x_values.append(x)
             y_values.append(y)
-            sizes.append(max(3.0, 34.0 - 5.0 * star.magnitude))
+            sizes.append(
+                marker_area(
+                    max(
+                        _STAR_FLOOR_PX,
+                        _STAR_BRIGHT_PX - _STAR_MAGNITUDE_FALLOFF_PX * star.magnitude,
+                    )
+                )
+            )
         if x_values:
             axes.scatter(
                 x_values,
@@ -537,7 +884,7 @@ class SkyChartRenderer:
         return len(x_values)
 
     @staticmethod
-    def _draw_moon(axes, moon: SkyChartObject) -> None:
+    def _draw_moon(axes, moon: SkyChartObject, labels: "_LabelPlacer") -> None:
         if not moon.drawn or moon.altaz.altitude_deg < 0:
             return
         x, y = project_altaz(moon.altaz.altitude_deg, moon.altaz.azimuth_deg)
@@ -563,46 +910,108 @@ class SkyChartRenderer:
                 radius,
                 fill=False,
                 edgecolor="#f1ead4",
-                linewidth=0.8,
+                linewidth=pt_from_canvas_px(_MOON_OUTLINE_PX),
                 zorder=4.2,
             )
         )
-        axes.text(x + 0.025, y + 0.025, moon.label, color="#e8e1ca", fontsize=7, zorder=4)
+        labels.add(
+            x,
+            y,
+            moon.label,
+            color="#e8e1ca",
+            fontsize=pt_from_canvas_px(_OBJECT_LABEL_FONT_PX),
+            zorder=4,
+        )
 
     @staticmethod
-    def _draw_planets(axes, planets: Sequence[SkyChartObject], planet_records) -> None:
+    def _draw_planets(
+        axes,
+        planets: Sequence[SkyChartObject],
+        planet_records,
+        labels: "_LabelPlacer",
+    ) -> None:
         for planet, (_body_name, _label, color, _coordinate) in zip(planets, planet_records, strict=True):
             if not planet.drawn:
                 continue
             x, y = project_altaz(planet.altaz.altitude_deg, planet.altaz.azimuth_deg)
-            axes.scatter([x], [y], s=46, c=color, edgecolors="#ffffff", linewidths=0.4, zorder=5)
-            axes.text(x + 0.02, y + 0.02, planet.label, color=color, fontsize=6.5, zorder=5)
+            axes.scatter(
+                [x],
+                [y],
+                s=marker_area(_PLANET_MARKER_PX),
+                c=color,
+                edgecolors="#ffffff",
+                linewidths=pt_from_canvas_px(_PLANET_EDGE_PX),
+                zorder=5,
+            )
+            labels.add(
+                x,
+                y,
+                planet.label,
+                color=color,
+                fontsize=pt_from_canvas_px(_OBJECT_LABEL_FONT_PX),
+                zorder=5,
+            )
 
     @staticmethod
-    def _draw_target(axes, target: SkyChartObject | None) -> None:
+    def _draw_target(axes, target: SkyChartObject | None, labels: "_LabelPlacer") -> None:
         if target is None or not target.drawn:
             return
         x, y = project_altaz(target.altaz.altitude_deg, target.altaz.azimuth_deg)
-        axes.scatter([x], [y], s=170, facecolors="none", edgecolors="#ffd43b", linewidths=1.1, zorder=6)
-        axes.scatter([x], [y], s=52, marker="+", c="#ffd43b", linewidths=1.3, zorder=6)
-        axes.text(x + 0.035, y + 0.035, target.label, color="#ffd43b", fontsize=8, zorder=6)
+        axes.scatter(
+            [x],
+            [y],
+            s=marker_area(_TARGET_RING_PX),
+            facecolors="none",
+            edgecolors="#ffd43b",
+            linewidths=pt_from_canvas_px(_TARGET_RING_LINE_PX),
+            zorder=6,
+        )
+        axes.scatter(
+            [x],
+            [y],
+            s=marker_area(_TARGET_CROSS_PX),
+            marker="+",
+            c="#ffd43b",
+            linewidths=pt_from_canvas_px(_TARGET_CROSS_LINE_PX),
+            zorder=6,
+        )
+        labels.add(
+            x,
+            y,
+            target.label,
+            color="#ffd43b",
+            fontsize=pt_from_canvas_px(_TARGET_LABEL_FONT_PX),
+            zorder=6,
+        )
 
     @staticmethod
     def _draw_footer(figure: Figure, request: SkyChartRequest, context: _RenderContext, selection: CatalogSelection) -> None:
+        # Two lines, not one: at the size the footer needs to stay legible on screen
+        # the single 144-character line would overflow the canvas. The observer's
+        # place name is free text, so the block is measured and fitted rather than
+        # assumed to fit.
         local = request.timestamp_local.isoformat()
         utc = context.timestamp_utc.isoformat().replace("+00:00", "Z")
-        footer = (
-            f"{request.observer.location_name} | {request.observer.timezone} | {local} | UTC {utc} | "
-            f"catalog {selection.mode_used}/{selection.status} | AltAz pressure=0 hPa | builtin ephemeris"
+        lines, fontsize_px = fit_footer_lines(
+            (
+                f"{request.observer.location_name} | {request.observer.timezone} | {local} | UTC {utc}",
+                f"catalog {selection.mode_used}/{selection.status} | AltAz pressure=0 hPa | builtin ephemeris",
+            ),
+            _FOOTER_FONT_PX,
         )
-        figure.text(0.5, 0.035, footer, color="#93a2aa", fontsize=7.5, ha="center", va="center")
+        fontsize = pt_from_canvas_px(fontsize_px)
+        for y, text in zip((0.0495, 0.0260), lines, strict=True):
+            figure.text(0.5, y, text, color="#93a2aa", fontsize=fontsize, ha="center", va="center")
 
     @staticmethod
     def _save_rgb_png(figure: Figure) -> bytes:
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
-                message=r"Glyph .* missing from font\(s\) DejaVu Sans\.",
+                # A place name may still carry a glyph no installed font covers.
+                # The chart renders correctly apart from that one character, so
+                # keep it out of stderr instead of failing the request.
+                message=r"Glyph .* missing from font\(s\) .*\.",
                 category=UserWarning,
             )
             canvas = figure.canvas
@@ -840,7 +1249,9 @@ def _encode_rgb_png(rgb_bytes: bytes, *, width: int, height: int) -> bytes:
 
 
 def _validate_rgb_png(png_bytes: bytes) -> None:
-    error = ValueError("render must be a valid 1200x900 RGB PNG")
+    error = ValueError(
+        f"render must be a valid {CANVAS_WIDTH_PX}x{CANVAS_HEIGHT_PX} RGB PNG"
+    )
     signature = b"\x89PNG\r\n\x1a\n"
     if not isinstance(png_bytes, bytes) or not png_bytes.startswith(signature):
         raise error

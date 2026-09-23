@@ -17,8 +17,8 @@ from astropy.coordinates import (
     solar_system_ephemeris,
 )
 from astropy.time import Time
-from astropy.utils import iers
 
+from starskill.astropy_offline import offline_iers
 from starskill.ephemeris_calculator import build_time_grid
 from starskill.schemas import (
     AstronomicalRelationshipResult,
@@ -112,7 +112,7 @@ def calculate_astronomical_relationship(
     with TemporaryDirectory(prefix="starskill-astropy-") as astropy_cache_dir:
         with (
             set_temp_cache(astropy_cache_dir),
-            iers.conf.set_temp("auto_download", False),
+            offline_iers(),
             solar_system_ephemeris.set("builtin"),
         ):
             times = Time([point.utc for point in points], scale="utc")

@@ -24,7 +24,7 @@
 
 ## 离线数据策略
 
-`iers.auto_download` 固定为 `False`。计算期间使用临时可写的 Astropy 缓存目录，使闰秒表和 IERS 检查只读取随依赖安装的离线数据，不访问远程 URL。元数据记录 Astropy 版本、UTC 时间尺度、AltAz 坐标系、折射设置和 IERS 下载策略。
+`iers.auto_download` 固定为 `False`，`iers.auto_max_age` 在计算期间设为 `None`（两者由 `starskill.astropy_offline.offline_iers()` 统一提供，星图、可见性规划与关系计算共用同一策略）。计算期间使用临时可写的 Astropy 缓存目录，使闰秒表和 IERS 检查只读取随依赖安装的离线数据，不访问远程 URL；观测日期超出随包预测范围时按表末数值外推，而不是抛异常。元数据记录 Astropy 版本、UTC 时间尺度、AltAz 坐标系、折射设置和 IERS 下载策略。
 
 这项策略优先保证课堂演示、测试和评审复现的一致性。长期运行时应定期升级 `astropy-iers-data`；如果观测日期超出随包数据覆盖范围，需要人工评估精度或更新离线数据。
 

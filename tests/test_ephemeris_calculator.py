@@ -1,5 +1,5 @@
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import warnings
 
@@ -103,6 +103,102 @@ def test_time_grid_rejects_end_before_start() -> None:
             timezone_name="Asia/Shanghai",
             interval_minutes=10,
         )
+
+
+def assert_uniform_monotonic_utc(points, interval_minutes: int) -> None:
+    instants = [point.utc for point in points]
+    assert len(instants) == len(set(instants)), "duplicate UTC instants in the grid"
+    assert all(a < b for a, b in zip(instants, instants[1:])), "UTC is not monotonic"
+    assert {b - a for a, b in zip(instants, instants[1:])} == {
+        timedelta(minutes=interval_minutes)
+    }
+
+
+def test_time_grid_skips_nonexistent_local_hour_without_duplicating_utc() -> None:
+    points = starskill.build_time_grid(
+        start=datetime(2026, 3, 8, 0, 0),
+        end=datetime(2026, 3, 8, 5, 0),
+        timezone_name="America/New_York",
+        interval_minutes=30,
+    )
+
+    assert_uniform_monotonic_utc(points, 30)
+    # Local 02:00-02:59 never happens on this date, so the grid must not claim it.
+    assert [point.local.isoformat() for point in points] == [
+        "2026-03-08T00:00:00-05:00",
+        "2026-03-08T00:30:00-05:00",
+        "2026-03-08T01:00:00-05:00",
+        "2026-03-08T01:30:00-05:00",
+        "2026-03-08T03:00:00-04:00",
+        "2026-03-08T03:30:00-04:00",
+        "2026-03-08T04:00:00-04:00",
+        "2026-03-08T04:30:00-04:00",
+        "2026-03-08T05:00:00-04:00",
+    ]
+
+
+def test_time_grid_keeps_both_passes_of_the_repeated_local_hour() -> None:
+    points = starskill.build_time_grid(
+        start=datetime(2026, 11, 1, 0, 0),
+        end=datetime(2026, 11, 1, 4, 0),
+        timezone_name="America/New_York",
+        interval_minutes=30,
+    )
+
+    assert_uniform_monotonic_utc(points, 30)
+    # The local hour really does occur twice; both passes carry distinct UTC instants.
+    assert [
+        point.local.isoformat() for point in points if point.local.hour == 1
+    ] == [
+        "2026-11-01T01:00:00-04:00",
+        "2026-11-01T01:30:00-04:00",
+        "2026-11-01T01:00:00-05:00",
+        "2026-11-01T01:30:00-05:00",
+    ]
+    assert [point.local.fold for point in points if point.local.hour == 1] == [0, 0, 1, 1]
+
+
+def test_time_grid_rejects_a_window_whose_start_a_dst_gap_skips() -> None:
+    # Local 02:30 never happens on this date, so 02:30-03:00 runs backwards in UTC.
+    # The guard must compare instants like the loop does: a wall-clock guard would
+    # accept the range and then return an empty grid for it.
+    for timezone_name, start, end in (
+        ("America/New_York", datetime(2023, 3, 12, 2, 30), datetime(2023, 3, 12, 3, 0)),
+        ("Antarctica/Troll", datetime(2023, 3, 26, 1, 30), datetime(2023, 3, 26, 3, 0)),
+        ("Europe/London", datetime(2026, 3, 29, 1, 45), datetime(2026, 3, 29, 2, 15)),
+        # A 60-minute local window that a gap collapses to zero real minutes.
+        ("America/New_York", datetime(2024, 3, 10, 2, 30), datetime(2024, 3, 10, 3, 30)),
+    ):
+        with pytest.raises(ValueError, match="end must be later than start"):
+            starskill.build_time_grid(
+                start=start,
+                end=end,
+                timezone_name=timezone_name,
+                interval_minutes=30,
+            )
+
+
+def test_time_grid_handles_a_half_hour_dst_shift() -> None:
+    # Australia/Lord_Howe shifts by 30 minutes, so local 02:00 is the only
+    # nonexistent instant and the offset steps +10:30 -> +11:00.
+    points = starskill.build_time_grid(
+        start=datetime(2026, 10, 4, 0, 0),
+        end=datetime(2026, 10, 4, 4, 0),
+        timezone_name="Australia/Lord_Howe",
+        interval_minutes=30,
+    )
+
+    assert_uniform_monotonic_utc(points, 30)
+    assert [point.local.isoformat() for point in points] == [
+        "2026-10-04T00:00:00+10:30",
+        "2026-10-04T00:30:00+10:30",
+        "2026-10-04T01:00:00+10:30",
+        "2026-10-04T01:30:00+10:30",
+        "2026-10-04T02:30:00+11:00",
+        "2026-10-04T03:00:00+11:00",
+        "2026-10-04T03:30:00+11:00",
+        "2026-10-04T04:00:00+11:00",
+    ]
 
 
 def make_observation_task(

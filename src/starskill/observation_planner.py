@@ -11,8 +11,8 @@ from astropy import units as u
 from astropy.config.paths import set_temp_cache
 from astropy.coordinates import get_body, get_sun
 from astropy.time import Time
-from astropy.utils import iers
 
+from starskill.astropy_offline import offline_iers
 from starskill.schemas import (
     EphemerisResult,
     ObservationPlanResult,
@@ -42,7 +42,7 @@ def calculate_moon_illumination(timestamps: Sequence[datetime]) -> list[float]:
     if not timestamps:
         return []
     with TemporaryDirectory(prefix="starskill-astropy-") as cache_dir:
-        with set_temp_cache(cache_dir), iers.conf.set_temp("auto_download", False):
+        with set_temp_cache(cache_dir), offline_iers():
             times = Time(list(timestamps), scale="utc")
             moon_vector = get_body("moon", times).cartesian.xyz.to(u.km)
             sun_vector = get_sun(times).cartesian.xyz.to(u.km)

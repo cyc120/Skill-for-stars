@@ -91,8 +91,8 @@ def valid_metadata() -> dict[str, object]:
         },
         "render": {
             "projection": "azimuthal_equidistant_zenith",
-            "width_px": 1200,
-            "height_px": 900,
+            "width_px": 2400,
+            "height_px": 2400,
             "layer_order": [
                 "background",
                 "horizon_grid",
@@ -152,7 +152,7 @@ def valid_metadata() -> dict[str, object]:
 
 def test_export_metadata_enforces_fixed_calculation_provenance() -> None:
     metadata = SkyChartExportMetadata.model_validate(valid_metadata())
-    assert metadata.render.width_px == 1200
+    assert metadata.render.width_px == 2400
     assert metadata.calculation.time_scale == "UTC"
     assert metadata.catalog.constellation_segments.sha256 == "c" * 64
     assert metadata.model_dump(mode="json")["created_at_utc"] == "2026-07-23T12:00:00Z"
